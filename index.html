@@ -3,8 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Rocky Hijab - VVIP + Auto Copy Struk</title>
+    <title>Rocky Hijab - VVIP + Auto Copy Struk (IndexedDB)</title>
     <style>
+        /* CSS sama persis dengan sebelumnya - tidak ada perubahan */
         :root {
             --primary: #0f172a;
             --accent: #f59e0b;
@@ -701,11 +702,44 @@
             font-style: normal;
             font-size: 12px;
         }
+
+        /* Loading indicator */
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.5);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 5000;
+        }
+        
+        .loading-spinner {
+            width: 50px;
+            height: 50px;
+            border: 5px solid #f3f3f3;
+            border-top: 5px solid var(--accent);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
     </style>
 </head>
 <body>
 
     <div id="customAlert">PERINGATAN</div>
+    
+    <!-- Loading Indicator -->
+    <div id="loadingOverlay" class="loading-overlay">
+        <div class="loading-spinner"></div>
+    </div>
 
     <!-- Print Area (hidden normally) -->
     <div id="printArea" style="display: none;"></div>
@@ -820,7 +854,7 @@
     <div class="app-container">
         <div class="app-header">
             <h1>ROCKY HIJAB</h1>
-            <p>CASIER VVIP</p>
+            <p>CASIER VVIP - INDEXEDDB</p>
         </div>
 
         <div class="main-content">
@@ -963,21 +997,316 @@
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     <script>
-        const baseMap = { 'P': 1, 'I': 2, 'N': 3, 'T': 4, 'U': 5, 'S': 6, 'O': 7, 'R': 8, 'G': 9, 'A': 0 };
-        const ADMIN_PASS = "170845";
-        const ADMIN_WA = "6285172107731";
+        // ==================== INDEXEDDB SETUP ====================
+        const DB_NAME = 'RockyHijabDB';
+        const DB_VERSION = 1;
         
-        let cart = JSON.parse(localStorage.getItem('rocky_cart_v12')) || [];
-        let memberContacts = JSON.parse(localStorage.getItem('rocky_contacts_v12')) || [];
-        let savedItemNames = JSON.parse(localStorage.getItem('rocky_item_names_v12')) || [];
-        let riwayatTransaksi = JSON.parse(localStorage.getItem('rocky_riwayat_v12')) || [];
-        let currentMode = 'sale';
-        let isKodeHidden = true;
-        let pendingAction = null;
-        let contactToDelete = null;
-        let filteredRiwayat = [];
-        let selectedPaperSize = '58mm';
+        // Store names
+        const STORES = {
+            CONTACTS: 'contacts',
+            ITEMS: 'items',
+            RIWAYAT: 'riwayat',
+            CART: 'cart',
+            SESSION: 'session'
+        };
 
+        let db = null;
+        let dbReady = false;
+        
+        // In-memory cache untuk akses cepat
+        let memberContacts = [];
+        let savedItemNames = [];
+        let riwayatTransaksi = [];
+        let cart = [];
+        let currentSession = { memberName: '', memberWa: '' };
+
+        // Queue operasi yang harus menunggu DB siap
+        let pendingOperations = [];
+
+        // Loading indicator
+        function showLoading(show = true) {
+            document.getElementById('loadingOverlay').style.display = show ? 'flex' : 'none';
+        }
+
+        // Inisialisasi IndexedDB
+        function initDB() {
+            return new Promise((resolve, reject) => {
+                const request = indexedDB.open(DB_NAME, DB_VERSION);
+                
+                request.onerror = (event) => {
+                    console.error('IndexedDB error:', event.target.error);
+                    showAlert('Gagal membuka database', true);
+                    reject(event.target.error);
+                };
+                
+                request.onsuccess = (event) => {
+                    db = event.target.result;
+                    dbReady = true;
+                    console.log('IndexedDB opened successfully');
+                    
+                    // Handle koneksi terputus
+                    db.onclose = () => {
+                        dbReady = false;
+                        console.log('Database connection closed');
+                    };
+                    
+                    db.onversionchange = () => {
+                        db.close();
+                        dbReady = false;
+                        console.log('Database version changed');
+                    };
+                    
+                    // Proses operasi yang tertunda
+                    pendingOperations.forEach(op => op());
+                    pendingOperations = [];
+                    
+                    resolve(db);
+                };
+                
+                request.onupgradeneeded = (event) => {
+                    const db = event.target.result;
+                    
+                    // Buat object stores jika belum ada
+                    if (!db.objectStoreNames.contains(STORES.CONTACTS)) {
+                        const contactStore = db.createObjectStore(STORES.CONTACTS, { keyPath: 'name' });
+                        contactStore.createIndex('wa', 'wa', { unique: false });
+                        contactStore.createIndex('poin', 'poin', { unique: false });
+                    }
+                    
+                    if (!db.objectStoreNames.contains(STORES.ITEMS)) {
+                        const itemStore = db.createObjectStore(STORES.ITEMS, { keyPath: 'name', autoIncrement: false });
+                        itemStore.createIndex('name', 'name', { unique: true });
+                    }
+                    
+                    if (!db.objectStoreNames.contains(STORES.RIWAYAT)) {
+                        const riwayatStore = db.createObjectStore(STORES.RIWAYAT, { keyPath: 'waktu' });
+                        riwayatStore.createIndex('member', 'member', { unique: false });
+                        riwayatStore.createIndex('waktu', 'waktu', { unique: false });
+                    }
+                    
+                    if (!db.objectStoreNames.contains(STORES.CART)) {
+                        db.createObjectStore(STORES.CART, { keyPath: 'id' });
+                    }
+                    
+                    if (!db.objectStoreNames.contains(STORES.SESSION)) {
+                        db.createObjectStore(STORES.SESSION, { keyPath: 'key' });
+                    }
+                    
+                    console.log('Database upgrade complete');
+                };
+            });
+        }
+
+        // Helper untuk operasi database dengan transaksi
+        async function dbOperation(storeName, mode, callback) {
+            if (!dbReady) {
+                return new Promise((resolve) => {
+                    pendingOperations.push(() => {
+                        resolve(dbOperation(storeName, mode, callback));
+                    });
+                });
+            }
+            
+            return new Promise((resolve, reject) => {
+                try {
+                    const transaction = db.transaction(storeName, mode);
+                    const store = transaction.objectStore(storeName);
+                    
+                    transaction.oncomplete = () => resolve(result);
+                    transaction.onerror = (e) => {
+                        console.error('Transaction error:', e.target.error);
+                        reject(e.target.error);
+                    };
+                    
+                    let result;
+                    const callbackResult = callback(store);
+                    
+                    if (callbackResult instanceof Promise) {
+                        callbackResult.then(r => {
+                            result = r;
+                        }).catch(reject);
+                    } else {
+                        result = callbackResult;
+                    }
+                } catch (error) {
+                    console.error('DB Operation error:', error);
+                    reject(error);
+                }
+            });
+        }
+
+        // ==================== LOAD ALL DATA ====================
+        async function loadAllData() {
+            showLoading(true);
+            try {
+                // Load contacts
+                await dbOperation(STORES.CONTACTS, 'readonly', (store) => {
+                    return new Promise((resolve, reject) => {
+                        const request = store.getAll();
+                        request.onsuccess = () => {
+                            memberContacts = request.result || [];
+                            resolve();
+                        };
+                        request.onerror = reject;
+                    });
+                });
+                
+                // Load items
+                await dbOperation(STORES.ITEMS, 'readonly', (store) => {
+                    return new Promise((resolve, reject) => {
+                        const request = store.getAll();
+                        request.onsuccess = () => {
+                            savedItemNames = (request.result || []).map(item => item.name);
+                            resolve();
+                        };
+                        request.onerror = reject;
+                    });
+                });
+                
+                // Load riwayat
+                await dbOperation(STORES.RIWAYAT, 'readonly', (store) => {
+                    return new Promise((resolve, reject) => {
+                        const request = store.getAll();
+                        request.onsuccess = () => {
+                            riwayatTransaksi = request.result || [];
+                            resolve();
+                        };
+                        request.onerror = reject;
+                    });
+                });
+                
+                // Load cart
+                await dbOperation(STORES.CART, 'readonly', (store) => {
+                    return new Promise((resolve, reject) => {
+                        const request = store.getAll();
+                        request.onsuccess = () => {
+                            cart = request.result || [];
+                            resolve();
+                        };
+                        request.onerror = reject;
+                    });
+                });
+                
+                // Load session
+                await dbOperation(STORES.SESSION, 'readonly', (store) => {
+                    return new Promise((resolve, reject) => {
+                        const request = store.get('currentMember');
+                        request.onsuccess = () => {
+                            if (request.result) {
+                                currentSession = request.result;
+                                document.getElementById('memberName').value = currentSession.memberName || '';
+                                document.getElementById('memberWa').value = currentSession.memberWa || '';
+                            }
+                            resolve();
+                        };
+                        request.onerror = reject;
+                    });
+                });
+                
+                console.log('All data loaded from IndexedDB');
+                renderTable();
+                checkMemberPoin();
+                checkMemberData();
+                
+            } catch (error) {
+                console.error('Error loading data:', error);
+                showAlert('Gagal memuat data', true);
+            } finally {
+                showLoading(false);
+            }
+        }
+
+        // ==================== SAVE FUNCTIONS ====================
+        async function saveContacts() {
+            await dbOperation(STORES.CONTACTS, 'readwrite', async (store) => {
+                // Clear all existing
+                await new Promise((resolve, reject) => {
+                    const clearRequest = store.clear();
+                    clearRequest.onsuccess = resolve;
+                    clearRequest.onerror = reject;
+                });
+                
+                // Save all contacts
+                for (const contact of memberContacts) {
+                    await new Promise((resolve, reject) => {
+                        const request = store.put(contact);
+                        request.onsuccess = resolve;
+                        request.onerror = reject;
+                    });
+                }
+            });
+        }
+
+        async function saveItems() {
+            await dbOperation(STORES.ITEMS, 'readwrite', async (store) => {
+                await new Promise((resolve, reject) => {
+                    const clearRequest = store.clear();
+                    clearRequest.onsuccess = resolve;
+                    clearRequest.onerror = reject;
+                });
+                
+                for (const name of savedItemNames) {
+                    await new Promise((resolve, reject) => {
+                        const request = store.put({ name });
+                        request.onsuccess = resolve;
+                        request.onerror = reject;
+                    });
+                }
+            });
+        }
+
+        async function saveRiwayat() {
+            await dbOperation(STORES.RIWAYAT, 'readwrite', async (store) => {
+                await new Promise((resolve, reject) => {
+                    const clearRequest = store.clear();
+                    clearRequest.onsuccess = resolve;
+                    clearRequest.onerror = reject;
+                });
+                
+                for (const r of riwayatTransaksi) {
+                    await new Promise((resolve, reject) => {
+                        const request = store.put(r);
+                        request.onsuccess = resolve;
+                        request.onerror = reject;
+                    });
+                }
+            });
+        }
+
+        async function saveCart() {
+            await dbOperation(STORES.CART, 'readwrite', async (store) => {
+                await new Promise((resolve, reject) => {
+                    const clearRequest = store.clear();
+                    clearRequest.onsuccess = resolve;
+                    clearRequest.onerror = reject;
+                });
+                
+                for (const item of cart) {
+                    await new Promise((resolve, reject) => {
+                        const request = store.put(item);
+                        request.onsuccess = resolve;
+                        request.onerror = reject;
+                    });
+                }
+            });
+        }
+
+        async function saveSession() {
+            await dbOperation(STORES.SESSION, 'readwrite', (store) => {
+                store.put({
+                    key: 'currentMember',
+                    memberName: document.getElementById('memberName').value,
+                    memberWa: document.getElementById('memberWa').value
+                });
+            });
+        }
+
+        // Modifikasi fungsi saveCurrentSession
+        function saveCurrentSession() {
+            saveSession().catch(e => console.error('Error saving session:', e));
+        }
+
+        // ==================== MODIFIED FUNCTIONS ====================
         function showAlert(text, isError = false) {
             const el = document.getElementById('customAlert');
             el.innerText = text;
@@ -1328,41 +1657,52 @@
         }
 
         // --- MANAJEMEN DATA & BACKUP ---
-        function copyDataToClipboard() {
-            const data = { contacts: memberContacts, items: savedItemNames, riwayat: riwayatTransaksi, ts: Date.now() };
-            const jsonStr = JSON.stringify(data);
-            const textArea = document.getElementById('hiddenClipboard');
-            textArea.value = jsonStr;
-            textArea.select();
-            textArea.setSelectionRange(0, 99999);
-            
+        async function copyDataToClipboard() {
+            showLoading(true);
             try {
+                const data = { contacts: memberContacts, items: savedItemNames, riwayat: riwayatTransaksi, ts: Date.now() };
+                const jsonStr = JSON.stringify(data);
+                const textArea = document.getElementById('hiddenClipboard');
+                textArea.value = jsonStr;
+                textArea.select();
+                textArea.setSelectionRange(0, 99999);
+                
                 document.execCommand('copy');
                 showAlert("DATA BERHASIL DISALIN");
             } catch (err) {
                 showAlert("GAGAL MENYALIN DATA", true);
+            } finally {
+                showLoading(false);
             }
         }
 
-        function importFromClipboard() {
+        async function importFromClipboard() {
             const input = prompt("TEMPEL DATA (JSON) YANG SUDAH DISALIN:");
             if (!input) return;
+            
+            showLoading(true);
             try {
                 const d = JSON.parse(input);
                 if (d.contacts) {
                     memberContacts = d.contacts;
                     savedItemNames = d.items || [];
                     riwayatTransaksi = d.riwayat || [];
-                    localStorage.setItem('rocky_contacts_v12', JSON.stringify(memberContacts));
-                    localStorage.setItem('rocky_item_names_v12', JSON.stringify(savedItemNames));
-                    localStorage.setItem('rocky_riwayat_v12', JSON.stringify(riwayatTransaksi));
+                    
+                    await saveContacts();
+                    await saveItems();
+                    await saveRiwayat();
+                    
                     showAlert("DATA BERHASIL DITEMPEL & DISIMPAN");
                     checkMemberPoin();
+                    renderContactList();
+                    filterRiwayat();
                 } else {
                     showAlert("FORMAT DATA TIDAK VALID", true);
                 }
             } catch (e) {
                 showAlert("DATA BUKAN FORMAT JSON VALID", true);
+            } finally {
+                showLoading(false);
             }
         }
 
@@ -1379,45 +1719,71 @@
             const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `rocky_v12_backup.json`; a.click();
         }
 
-        function importDataJSON(e) {
+        async function importDataJSON(e) {
             const f = e.target.files[0]; if(!f) return;
-            const r = new FileReader(); r.onload = (ev) => {
+            
+            showLoading(true);
+            const r = new FileReader(); 
+            r.onload = async (ev) => {
                 try {
                     const d = JSON.parse(ev.target.result);
                     memberContacts = d.contacts || [];
                     savedItemNames = d.items || [];
                     riwayatTransaksi = d.riwayat || [];
-                    localStorage.setItem('rocky_contacts_v12', JSON.stringify(memberContacts));
-                    localStorage.setItem('rocky_item_names_v12', JSON.stringify(savedItemNames));
-                    localStorage.setItem('rocky_riwayat_v12', JSON.stringify(riwayatTransaksi));
-                    showAlert("DATA DIIMPORT"); toggleModal('dataModal'); checkMemberPoin();
-                } catch(e) { showAlert("FILE TIDAK VALID", true); }
-            }; r.readAsText(f);
-        }
-
-        function confirmDeleteAllData() {
-            if (confirm("HAPUS SEMUA DATA APLIKASI?")) {
-                askPassword(() => {
-                    localStorage.clear();
-                    cart = [];
-                    memberContacts = [];
-                    savedItemNames = [];
-                    riwayatTransaksi = [];
-                    localStorage.setItem('rocky_contacts_v12', JSON.stringify(memberContacts));
-                    localStorage.setItem('rocky_item_names_v12', JSON.stringify(savedItemNames));
-                    localStorage.setItem('rocky_riwayat_v12', JSON.stringify(riwayatTransaksi));
-                    document.getElementById('memberName').value = '';
-                    document.getElementById('memberWa').value = '';
-                    renderTable();
+                    
+                    await saveContacts();
+                    await saveItems();
+                    await saveRiwayat();
+                    
+                    showAlert("DATA DIIMPORT"); 
+                    toggleModal('dataModal'); 
+                    checkMemberPoin();
                     renderContactList();
                     filterRiwayat();
-                    showAlert("SEMUA DATA DIHAPUS");
+                } catch(e) { 
+                    showAlert("FILE TIDAK VALID", true); 
+                } finally {
+                    showLoading(false);
+                }
+            }; 
+            r.readAsText(f);
+        }
+
+        async function confirmDeleteAllData() {
+            if (confirm("HAPUS SEMUA DATA APLIKASI?")) {
+                askPassword(async () => {
+                    showLoading(true);
+                    try {
+                        // Clear all stores
+                        await dbOperation(STORES.CONTACTS, 'readwrite', (store) => store.clear());
+                        await dbOperation(STORES.ITEMS, 'readwrite', (store) => store.clear());
+                        await dbOperation(STORES.RIWAYAT, 'readwrite', (store) => store.clear());
+                        await dbOperation(STORES.CART, 'readwrite', (store) => store.clear());
+                        await dbOperation(STORES.SESSION, 'readwrite', (store) => store.clear());
+                        
+                        cart = [];
+                        memberContacts = [];
+                        savedItemNames = [];
+                        riwayatTransaksi = [];
+                        
+                        document.getElementById('memberName').value = '';
+                        document.getElementById('memberWa').value = '';
+                        renderTable();
+                        renderContactList();
+                        filterRiwayat();
+                        showAlert("SEMUA DATA DIHAPUS");
+                    } catch (error) {
+                        showAlert("GAGAL MENGHAPUS DATA", true);
+                    } finally {
+                        showLoading(false);
+                    }
                 });
             }
         }
 
         // --- HARGA & TRANSAKSI ---
         function calcPrice(kode) {
+            const baseMap = { 'P': 1, 'I': 2, 'N': 3, 'T': 4, 'U': 5, 'S': 6, 'O': 7, 'R': 8, 'G': 9, 'A': 0 };
             const input = kode.toUpperCase().replace(/\s/g, '');
             if (!input) return 0;
             let total = 0; let temp = input;
@@ -1518,17 +1884,20 @@
             checkMemberData();
         }
 
-        function addItem() {
+        async function addItem() {
             const nEl = document.getElementById('itemName'), cEl = document.getElementById('itemCode'), qEl = document.getElementById('itemQty');
             const name = nEl.value.trim().toUpperCase(), code = cEl.value.trim().toUpperCase();
             const price = calcPrice(code);
             if (!name || price === 0) return;
+            
             if (!savedItemNames.includes(name)) {
                 savedItemNames.push(name);
-                localStorage.setItem('rocky_item_names_v12', JSON.stringify(savedItemNames));
+                await saveItems();
             }
+            
             cart.push({ id: Date.now(), name: currentMode === 'retur' ? name + " (RETUR)" : name, code, qty: parseInt(qEl.value), priceUnit: price, subtotal: price * parseInt(qEl.value), type: currentMode });
-            localStorage.setItem('rocky_cart_v12', JSON.stringify(cart));
+            await saveCart();
+            
             renderTable();
             nEl.value = ""; cEl.value = ""; qEl.value = "1";
             document.getElementById('pricePreview').style.display = 'none';
@@ -1554,7 +1923,7 @@
             return { name, wa, sItems, rItems, tSale, tRetur, pTukar, sisaBayar, poinGet, poinAkhir };
         }
 
-        function finishTransactionAfterShare(d) {
+        async function finishTransactionAfterShare(d) {
             const waktu = new Date().toISOString();
             const items = cart.map(i => ({ name: i.name, code: i.code, qty: i.qty, priceUnit: i.priceUnit, subtotal: i.subtotal, type: i.type }));
             riwayatTransaksi.push({
@@ -1569,7 +1938,7 @@
                 poinGet: d.poinGet,
                 poinAkhir: d.poinAkhir
             });
-            localStorage.setItem('rocky_riwayat_v12', JSON.stringify(riwayatTransaksi));
+            await saveRiwayat();
 
             let mIdx = memberContacts.findIndex(c => c.name === d.name);
             if (mIdx === -1) {
@@ -1578,68 +1947,81 @@
                 memberContacts[mIdx].wa = d.wa;
                 memberContacts[mIdx].poin = d.poinAkhir;
             }
-            localStorage.setItem('rocky_contacts_v12', JSON.stringify(memberContacts));
+            await saveContacts();
 
             cart = [];
-            localStorage.removeItem('rocky_cart_v12');
+            await saveCart();
+            
             document.getElementById('memberName').value = '';
             document.getElementById('memberWa').value = '';
             document.getElementById('inputPoinTukar').value = '';
-            saveCurrentSession();
+            await saveSession();
+            
             renderTable();
             showAlert("TRANSAKSI & POIN BERHASIL DISIMPAN");
         }
 
         // FUNGSI UTAMA: SELESAIKAN, SIMPAN POIN, DAN COPY STRUK
-        function processFinalTransaction() {
+        async function processFinalTransaction() {
             if (cart.length === 0) return;
+            
             const d = getTransactionData();
             if (!d.name || !d.wa) { 
                 showAlert("NAMA & WA WAJIB DIISI", true); 
                 return; 
             }
 
-            // Simpan transaksi
-            const waktu = new Date().toISOString();
-            const items = cart.map(i => ({ name: i.name, code: i.code, qty: i.qty, priceUnit: i.priceUnit, subtotal: i.subtotal, type: i.type }));
-            riwayatTransaksi.push({
-                waktu,
-                member: d.name,
-                wa: d.wa,
-                items: items,
-                tSale: d.tSale,
-                tRetur: d.tRetur,
-                pTukar: d.pTukar,
-                sisaBayar: d.sisaBayar,
-                poinGet: d.poinGet,
-                poinAkhir: d.poinAkhir
-            });
-            localStorage.setItem('rocky_riwayat_v12', JSON.stringify(riwayatTransaksi));
+            showLoading(true);
+            try {
+                // Simpan transaksi
+                const waktu = new Date().toISOString();
+                const items = cart.map(i => ({ name: i.name, code: i.code, qty: i.qty, priceUnit: i.priceUnit, subtotal: i.subtotal, type: i.type }));
+                riwayatTransaksi.push({
+                    waktu,
+                    member: d.name,
+                    wa: d.wa,
+                    items: items,
+                    tSale: d.tSale,
+                    tRetur: d.tRetur,
+                    pTukar: d.pTukar,
+                    sisaBayar: d.sisaBayar,
+                    poinGet: d.poinGet,
+                    poinAkhir: d.poinAkhir
+                });
+                await saveRiwayat();
 
-            // Update poin member
-            let mIdx = memberContacts.findIndex(c => c.name === d.name);
-            if (mIdx === -1) {
-                memberContacts.push({ name: d.name, wa: d.wa, poin: d.poinAkhir });
-            } else {
-                memberContacts[mIdx].wa = d.wa;
-                memberContacts[mIdx].poin = d.poinAkhir;
+                // Update poin member
+                let mIdx = memberContacts.findIndex(c => c.name === d.name);
+                if (mIdx === -1) {
+                    memberContacts.push({ name: d.name, wa: d.wa, poin: d.poinAkhir });
+                } else {
+                    memberContacts[mIdx].wa = d.wa;
+                    memberContacts[mIdx].poin = d.poinAkhir;
+                }
+                await saveContacts();
+
+                // COPY STRUK KE CLIPBOARD
+                copyStrukToClipboard();
+
+                // Bersihkan keranjang dan form
+                cart = [];
+                await saveCart();
+                
+                document.getElementById('memberName').value = '';
+                document.getElementById('memberWa').value = '';
+                document.getElementById('inputPoinTukar').value = '';
+                await saveSession();
+                
+                renderTable();
+                
+                // Tampilkan notifikasi
+                showAlert("✓ TRANSAKSI SELESAI & STRUK DISALIN");
+            } catch (error) {
+                showAlert("GAGAL MENYIMPAN TRANSAKSI", true);
+                console.error(error);
+            } finally {
+                showLoading(false);
             }
-            localStorage.setItem('rocky_contacts_v12', JSON.stringify(memberContacts));
-
-            // COPY STRUK KE CLIPBOARD
-            copyStrukToClipboard();
-
-            // Bersihkan keranjang dan form
-            cart = [];
-            localStorage.removeItem('rocky_cart_v12');
-            document.getElementById('memberName').value = '';
-            document.getElementById('memberWa').value = '';
-            document.getElementById('inputPoinTukar').value = '';
-            saveCurrentSession();
-            renderTable();
-            
-            // Tampilkan notifikasi
-            showAlert("✓ TRANSAKSI SELESAI & STRUK DISALIN");
         }
 
         // --- UI HELPERS ---
@@ -1733,22 +2115,32 @@
             } else box.style.display = 'none';
         }
 
-        function updateQty(id, val) {
+        async function updateQty(id, val) {
             const idx = cart.findIndex(i => i.id === id);
             if (idx > -1) {
                 cart[idx].qty = Math.max(1, parseInt(val) || 1);
                 cart[idx].subtotal = cart[idx].priceUnit * cart[idx].qty;
-                localStorage.setItem('rocky_cart_v12', JSON.stringify(cart));
+                await saveCart();
                 renderTable();
             }
         }
 
-        function deleteItem(id) { cart = cart.filter(i => i.id !== id); localStorage.setItem('rocky_cart_v12', JSON.stringify(cart)); renderTable(); }
+        async function deleteItem(id) { 
+            cart = cart.filter(i => i.id !== id); 
+            await saveCart(); 
+            renderTable(); 
+        }
+        
         function toggleHidden() { isKodeHidden = !isKodeHidden; renderTable(); }
-        function clearCart() { cart = []; localStorage.removeItem('rocky_cart_v12'); renderTable(); }
+        
+        async function clearCart() { 
+            cart = []; 
+            await saveCart(); 
+            renderTable(); 
+        }
+        
         function saveCurrentSession() { 
-            localStorage.setItem('rocky_current_name', document.getElementById('memberName').value); 
-            localStorage.setItem('rocky_current_wa', document.getElementById('memberWa').value); 
+            saveSession().catch(e => console.error('Error saving session:', e));
             checkMemberPoin(); 
             checkMemberData();
         }
@@ -1766,18 +2158,23 @@
             renderTable();
         }
 
-        function saveManualPoin(name) {
+        async function saveManualPoin(name) {
             const inputId = `poinManual_${name.replace(/\s/g, '_')}`;
             const amount = parseInt(document.getElementById(inputId).value) || 0;
             if (amount === 0) return;
-            askPassword(() => {
-                const idx = memberContacts.findIndex(c => c.name === name);
-                if (idx > -1) {
-                    memberContacts[idx].poin = Math.max(0, (memberContacts[idx].poin || 0) + amount);
-                    localStorage.setItem('rocky_contacts_v12', JSON.stringify(memberContacts));
-                    renderContactList();
-                    checkMemberPoin();
-                    showAlert("POIN DIPERBARUI");
+            askPassword(async () => {
+                showLoading(true);
+                try {
+                    const idx = memberContacts.findIndex(c => c.name === name);
+                    if (idx > -1) {
+                        memberContacts[idx].poin = Math.max(0, (memberContacts[idx].poin || 0) + amount);
+                        await saveContacts();
+                        renderContactList();
+                        checkMemberPoin();
+                        showAlert("POIN DIPERBARUI");
+                    }
+                } finally {
+                    showLoading(false);
                 }
             });
         }
@@ -1787,15 +2184,20 @@
             toggleModal('deleteContactModal');
         }
 
-        function verifyDeleteContact() {
+        async function verifyDeleteContact() {
             const password = document.getElementById('deleteContactPassword').value;
             if (password === ADMIN_PASS) {
-                memberContacts = memberContacts.filter(c => c.name !== contactToDelete);
-                localStorage.setItem('rocky_contacts_v12', JSON.stringify(memberContacts));
-                toggleModal('deleteContactModal');
-                renderContactList();
-                checkMemberPoin();
-                showAlert("KONTAK DIHAPUS");
+                showLoading(true);
+                try {
+                    memberContacts = memberContacts.filter(c => c.name !== contactToDelete);
+                    await saveContacts();
+                    toggleModal('deleteContactModal');
+                    renderContactList();
+                    checkMemberPoin();
+                    showAlert("KONTAK DIHAPUS");
+                } finally {
+                    showLoading(false);
+                }
             } else {
                 showAlert("SANDI SALAH!", true);
             }
@@ -1904,12 +2306,17 @@
             checkboxes.forEach(cb => cb.checked = select);
         }
 
-        function clearRiwayat() {
+        async function clearRiwayat() {
             if (confirm("HAPUS SEMUA RIWAYAT?")) {
-                riwayatTransaksi = [];
-                localStorage.setItem('rocky_riwayat_v12', JSON.stringify(riwayatTransaksi));
-                filterRiwayat();
-                showAlert("RIWAYAT DIHAPUS");
+                showLoading(true);
+                try {
+                    riwayatTransaksi = [];
+                    await saveRiwayat();
+                    filterRiwayat();
+                    showAlert("RIWAYAT DIHAPUS");
+                } finally {
+                    showLoading(false);
+                }
             }
         }
 
@@ -1975,17 +2382,32 @@
             }
         }
 
-        window.onload = () => {
-            document.getElementById('memberName').value = localStorage.getItem('rocky_current_name') || '';
-            document.getElementById('memberWa').value = localStorage.getItem('rocky_current_wa') || '';
-            checkMemberPoin(); 
-            renderTable();
-            checkMemberData();
-            switchTab('sale');
+        // Inisialisasi saat halaman dimuat
+        window.onload = async () => {
+            const baseMap = { 'P': 1, 'I': 2, 'N': 3, 'T': 4, 'U': 5, 'S': 6, 'O': 7, 'R': 8, 'G': 9, 'A': 0 };
+            const ADMIN_PASS = "170845";
+            const ADMIN_WA = "6285172107731";
             
+            let currentMode = 'sale';
+            let isKodeHidden = true;
+            let pendingAction = null;
+            let contactToDelete = null;
+            let filteredRiwayat = [];
+            let selectedPaperSize = '58mm';
+            
+            // Inisialisasi database
+            await initDB();
+            await loadAllData();
+            
+            // Set tanggal default
             const today = new Date().toISOString().split('T')[0];
             document.getElementById('startDate').value = today;
             document.getElementById('endDate').value = today;
+            
+            renderTable();
+            checkMemberPoin();
+            checkMemberData();
+            switchTab('sale');
         };
     </script>
 </body>
